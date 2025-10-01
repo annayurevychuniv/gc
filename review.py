@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-review.py — Vertex AI / Google Generative AI Code Review bot
+review.py — Vertex AI Code Review bot (GenAI SDK)
 
-Використовує Google Generative AI SDK для Gemini 2.5 Flash замість старого Vertex Predict REST.
+- Отримує PR info з GITHUB_EVENT_PATH або з REPO+PR_NUMBER (локально).
+- Лістає файли PR через GitHub API.
+- Для кожного текстового файлу робить запит до Gemini через Google Generative AI SDK.
+- Формує один коментар у PR з усіма оглядами.
 
 Env vars:
 - GCP_PROJECT_ID
@@ -10,7 +13,7 @@ Env vars:
 - GCP_MODEL (наприклад gemini-2.5-flash)
 - GOOGLE_APPLICATION_CREDENTIALS -> шлях до service account JSON
 - GITHUB_TOKEN
-- GITHUB_REPOSITORY (owner/repo)
+- GITHUB_REPOSITORY
 - PR_NUMBER
 """
 
@@ -26,20 +29,23 @@ from google import genai
 # -------------------
 GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-GCP_MODEL = os.getenv("GCP_MODEL", "gemini-2.5-flash")
+GCP_MODEL = os.getenv("GCP_MODEL", "gemini-1.5-flash-002")
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
 PR_NUMBER_ENV = os.getenv("PR_NUMBER")
 
+# -------------------
+# GitHub headers
+# -------------------
 GH_HEADERS = {
     "Accept": "application/vnd.github+json",
     "Authorization": f"token {GITHUB_TOKEN}" if GITHUB_TOKEN else ""
 }
 
 # -------------------
-# GitHub / PR helpers
+# Helpers: GitHub / PR
 # -------------------
 def get_event_json():
     ev_path = os.getenv("GITHUB_EVENT_PATH")
@@ -58,7 +64,7 @@ def get_pr_info():
     if GITHUB_REPOSITORY and PR_NUMBER_ENV:
         owner, repo = GITHUB_REPOSITORY.split("/")
         return owner, repo, int(PR_NUMBER_ENV)
-    print("ERROR: Could not determine PR info")
+    print("ERROR: Could not determine PR info. Provide GITHUB_EVENT_PATH or set GITHUB_REPOSITORY+PR_NUMBER.")
     sys.exit(1)
 
 def list_pr_files(owner: str, repo: str, pr_number: int) -> List[dict]:
@@ -93,7 +99,7 @@ def fetch_raw_content(raw_url: str) -> str:
     return ""
 
 # -------------------
-# GCP GenAI SDK
+# Helpers: GenAI
 # -------------------
 client = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
 
@@ -101,7 +107,7 @@ def call_genai_model(prompt: str) -> str:
     try:
         response = client.models.generate_content(
             model=GCP_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            prompt=prompt
         )
         if hasattr(response, "candidates") and len(response.candidates) > 0:
             return response.candidates[0].content
@@ -115,7 +121,7 @@ def call_genai_model(prompt: str) -> str:
 # -------------------
 def build_comment(reviews: List[dict]) -> str:
     lines = []
-    lines.append("## Gemini AI — Automated Code Review\n")
+    lines.append("## Vertex AI — Automated Code Review (PoC)\n")
     lines.append("I am an automated reviewer. Suggestions below:\n")
     for r in reviews:
         lines.append("---")
@@ -135,9 +141,11 @@ def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
         print("Failed to post comment:", r.status_code, r.text)
 
 # -------------------
-# Utility
+# Utility: detect likely text file
 # -------------------
-TEXT_FILE_EXTENSIONS = {".py", ".js", ".ts", ".java", ".go", ".rs", ".c", ".cpp", ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".sh", ".rb", ".php"}
+TEXT_FILE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".java", ".go", ".rs", ".c", ".cpp", ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".sh", ".rb", ".php"
+}
 
 def is_text_file(filename: str) -> bool:
     low = filename.lower()
@@ -175,10 +183,8 @@ def main():
             content = content[:MAX_CHARS] + "\n\n...file truncated..."
         prompt = (
             "You are a senior software engineer and code reviewer.\n"
-            "Provide concise, actionable review comments as bullet points. "
-            "Mention potential bugs, security issues, and style improvements. "
-            "If you suggest code changes, provide short examples.\n\n"
-            f"Review file: {filename}\n\n```{content}```\n"
+            "Provide concise, actionable review comments as bullet points.\n"
+            f"Review file: {filename}\n\n```{content}```"
         )
         review_text = call_genai_model(prompt)
         reviews.append({"path": filename, "review": review_text})
