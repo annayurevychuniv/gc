@@ -1,4 +1,4 @@
-# Test file for Vertex AI Code Review Bot
+# Test file for Vertex AI Code Review
 print("Hello, world!")
 
 # ❌ 1. Використання незахищеного вводу
