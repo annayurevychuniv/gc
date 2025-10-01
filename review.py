@@ -1,95 +1,172 @@
+#!/usr/bin/env python3
+"""
+review.py — Vertex AI Code Review bot (Gemini 2.5 Flash)
+
+Env vars (в workflow встановлюються автоматично або через secrets):
+- GCP_PROJECT_ID
+- GCP_LOCATION (наприклад us-central1)
+- GCP_MODEL (gemini-2.5-flash)
+- GOOGLE_APPLICATION_CREDENTIALS -> шлях до service account JSON
+- GITHUB_TOKEN
+- GITHUB_REPOSITORY (owner/repo)
+- PR_NUMBER
+"""
+
 import os
+import sys
 import json
 import requests
-from github import Github
-from google.cloud import aiplatform
-from google.oauth2 import service_account
+from typing import List
+from google import genai
 
-# ==========================
-# Конфігурація
-# ==========================
+# -------------------
+# Config from env
+# -------------------
 GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-GCP_MODEL = os.getenv("GCP_MODEL", "text-bison@001")
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-
+GCP_MODEL = os.getenv("GCP_MODEL", "gemini-2.5-flash")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-REPO_NAME = os.getenv("GITHUB_REPOSITORY")  # owner/repo
-PR_NUMBER = int(os.getenv("PR_NUMBER"))
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
+PR_NUMBER_ENV = os.getenv("PR_NUMBER")
 
-# ==========================
-# Ініціалізація Vertex AI
-# ==========================
-credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON)
-aiplatform.init(project=GCP_PROJECT, location=GCP_LOCATION, credentials=credentials)
-model = aiplatform.ChatModel.from_pretrained(GCP_MODEL)
+GH_HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "Authorization": f"token {GITHUB_TOKEN}" if GITHUB_TOKEN else ""
+}
 
-# ==========================
-# Функції
-# ==========================
-def analyze_code(file_name: str, content: str) -> str:
-    chat = model.start_chat()
-    prompt = (
-        f"You are a senior software engineer. "
-        f"Provide concise, actionable review for the following code file `{file_name}`:\n\n"
-        f"```{content}```\n\n"
-        f"Focus on potential bugs, security issues, and style improvements."
-    )
-    response = chat.send_message(prompt, temperature=0.2, max_output_tokens=512)
-    return response.text
+TEXT_FILE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".java", ".go", ".rs", ".c", ".cpp",
+    ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".sh", ".rb", ".php"
+}
 
-def get_pr_files(owner: str, repo: str, pr_number: int):
+# -------------------
+# GitHub helpers
+# -------------------
+def get_pr_info():
+    if GITHUB_REPOSITORY and PR_NUMBER_ENV:
+        owner, repo = GITHUB_REPOSITORY.split("/")
+        return owner, repo, int(PR_NUMBER_ENV)
+    print("ERROR: Provide GITHUB_REPOSITORY and PR_NUMBER env vars")
+    sys.exit(1)
+
+def list_pr_files(owner: str, repo: str, pr_number: int) -> List[dict]:
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    r = requests.get(url, headers=headers)
-    r.raise_for_status()
-    return r.json()
+    files = []
+    page = 1
+    while True:
+        r = requests.get(url, headers=GH_HEADERS, params={"per_page": 100, "page": page}, timeout=30)
+        if r.status_code != 200:
+            print("Failed to fetch PR files:", r.status_code, r.text)
+            break
+        data = r.json()
+        if not data:
+            break
+        files.extend(data)
+        if len(data) < 100:
+            break
+        page += 1
+    return files
 
-def fetch_file_content(raw_url: str):
+def fetch_raw_content(raw_url: str) -> str:
     headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-    r = requests.get(raw_url, headers=headers)
-    if r.status_code == 200:
-        return r.text
+    try:
+        r = requests.get(raw_url, headers=headers, timeout=30)
+        if r.status_code == 200:
+            return r.text
+        print(f"Failed to fetch raw content ({raw_url}): {r.status_code}")
+    except Exception as e:
+        print("Exception fetching raw content:", e)
     return ""
 
-def post_comment(owner: str, repo: str, pr_number: int, body: str):
+def is_text_file(filename: str) -> bool:
+    low = filename.lower()
+    return any(low.endswith(ext) for ext in TEXT_FILE_EXTENSIONS)
+
+# -------------------
+# Vertex AI / Gemini helpers
+# -------------------
+def init_genai_client():
+    if not GCP_PROJECT:
+        raise RuntimeError("GCP_PROJECT_ID not set")
+    client = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
+    return client
+
+def review_file(client, filename: str, content: str) -> str:
+    prompt = (
+        "You are a senior software engineer and code reviewer.\n"
+        "Provide concise, actionable review comments as bullet points. "
+        "Mention potential bugs, security issues, and style improvements.\n\n"
+        f"Review file: {filename}\n\n```{content}```"
+    )
+    try:
+        response = client.models.generate_content(
+            model=GCP_MODEL,
+            input=[{"role": "user", "content": prompt}]
+        )
+        return response.output_text
+    except Exception as e:
+        print(f"GenAI model call failed for {filename}:", e)
+        return f"(GenAI model call failed: {e})"
+
+# -------------------
+# GitHub PR comment helpers
+# -------------------
+def build_comment(reviews: List[dict]) -> str:
+    lines = ["## Vertex AI — Automated Code Review (Gemini 2.5 Flash)\n",
+             "I am an automated reviewer. Suggestions below:\n"]
+    for r in reviews:
+        lines.append("---")
+        lines.append(f"**File:** `{r['path']}`\n")
+        lines.append(r["review"])
+    lines.append("\n*This is an automated comment.*")
+    return "\n".join(lines)
+
+def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    r = requests.post(url, headers=headers, json={"body": body})
+    r = requests.post(url, headers=GH_HEADERS, json={"body": body})
     if r.status_code in (200, 201):
-        print(f"Comment posted to PR #{pr_number}")
+        print("Comment posted to PR")
     else:
         print("Failed to post comment:", r.status_code, r.text)
 
-# ==========================
-# Основна логіка
-# ==========================
+# -------------------
+# Main
+# -------------------
 def main():
-    owner, repo = REPO_NAME.split("/")
-    pr_number = PR_NUMBER
+    owner, repo, pr_number = get_pr_info()
+    print(f"Reviewing PR: {owner}/{repo}#{pr_number}")
 
-    files = get_pr_files(owner, repo, pr_number)
+    files = list_pr_files(owner, repo, pr_number)
     if not files:
-        print("No files found in PR.")
+        print("No files to review")
         return
 
+    client = init_genai_client()
     reviews = []
+
     for f in files:
-        file_name = f["filename"]
-        raw_url = f["raw_url"]
-        print(f"Processing {file_name}...")
-        content = fetch_file_content(raw_url)
-        if not content:
+        filename = f.get("filename")
+        raw_url = f.get("raw_url")
+        if not is_text_file(filename):
+            print("Skipping non-text file:", filename)
             continue
-        # Обрізаємо великі файли для Vertex AI
+        print("Processing", filename)
+        content = fetch_raw_content(raw_url)
+        if not content:
+            print("No content for", filename)
+            continue
         MAX_CHARS = 25000
         if len(content) > MAX_CHARS:
-            content = content[:MAX_CHARS] + "\n\n...truncated..."
-        review_text = analyze_code(file_name, content)
-        reviews.append(f"**{file_name}**:\n{review_text}\n")
+            content = content[:MAX_CHARS] + "\n\n...file truncated..."
+        review_text = review_file(client, filename, content)
+        reviews.append({"path": filename, "review": review_text})
 
-    comment_body = "## Vertex AI — Automated Code Review\n\n" + "\n---\n".join(reviews)
-    post_comment(owner, repo, pr_number, comment_body)
+    if not reviews:
+        print("No reviews generated.")
+        return
+
+    comment = build_comment(reviews)
+    post_pr_comment(owner, repo, pr_number, comment)
 
 if __name__ == "__main__":
     main()
