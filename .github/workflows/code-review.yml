@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-permissions:                      
+permissions:
   contents: read
   issues: write
   pull-requests: write
@@ -14,26 +14,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Клонування репозиторію
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2️⃣ Встановлення Python
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      # 3️⃣ Встановлення залежностей + Google Generative AI SDK
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install --upgrade google-genai
 
-      # 4️⃣ Налаштування Google Cloud Service Account
       - name: Configure GCP Service Account
         env:
           GCP_KEY_JSON: ${{ secrets.GCP_KEY_JSON }}
@@ -47,10 +42,9 @@ jobs:
           echo "GCP_LOCATION=$GCP_LOCATION" >> $GITHUB_ENV
           echo "GCP_MODEL=$GCP_MODEL" >> $GITHUB_ENV
 
-      # 5️⃣ Запуск Code Review Bot (оновлений для Gemini 2.5 Flash)
       - name: Run Code Review Bot
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
