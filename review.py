@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-review.py — Vertex AI Code Review bot using Google Generative AI SDK
+review.py — Vertex AI Code Review bot (Gemini 2.5 Flash)
 
-- Отримує PR info з GITHUB_EVENT_PATH або з REPO+PR_NUMBER (локально)
-- Лістає файли PR через GitHub API
-- Для кожного текстового файлу генерує коментар через Gemini model
-- Формує один коментар у PR з усіма оглядами
+- Працює через Google Gen AI Python SDK
+- З GitHub отримує PR, читає текстові файли
+- Робить запит до Gemini та формує коментар
 """
 
 import os
@@ -13,7 +12,6 @@ import sys
 import json
 import requests
 from typing import List
-
 from google import genai
 
 # -------------------
@@ -21,7 +19,7 @@ from google import genai
 # -------------------
 GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-GCP_MODEL = os.getenv("GCP_MODEL", "gemini-1.5-flash-002")  # оновлено для Gemini
+GCP_MODEL = os.getenv("GCP_MODEL", "gemini-2.5-flash")  # або gemini-2.5-flash-lite
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
 PR_NUMBER_ENV = os.getenv("PR_NUMBER")
@@ -35,24 +33,11 @@ GH_HEADERS = {
 # -------------------
 # Helpers: GitHub / PR
 # -------------------
-def get_event_json():
-    ev_path = os.getenv("GITHUB_EVENT_PATH")
-    if ev_path and os.path.exists(ev_path):
-        with open(ev_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
-
 def get_pr_info():
-    ev = get_event_json()
-    if ev and "pull_request" in ev:
-        owner = ev["repository"]["owner"]["login"]
-        repo = ev["repository"]["name"]
-        pr_number = ev["pull_request"]["number"]
-        return owner, repo, pr_number
     if GITHUB_REPOSITORY and PR_NUMBER_ENV:
         owner, repo = GITHUB_REPOSITORY.split("/")
         return owner, repo, int(PR_NUMBER_ENV)
-    print("ERROR: Could not determine PR info.")
+    print("ERROR: GITHUB_REPOSITORY or PR_NUMBER not set")
     sys.exit(1)
 
 def list_pr_files(owner: str, repo: str, pr_number: int) -> List[dict]:
@@ -74,47 +59,57 @@ def list_pr_files(owner: str, repo: str, pr_number: int) -> List[dict]:
     return files
 
 def fetch_raw_content(raw_url: str) -> str:
-    headers = {}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
     try:
         r = requests.get(raw_url, headers=headers, timeout=30)
         if r.status_code == 200:
             return r.text
-        print(f"Failed to fetch raw content ({raw_url}): {r.status_code}")
     except Exception as e:
         print("Exception fetching raw content:", e)
     return ""
 
 # -------------------
-# GenAI Model Call
+# Helpers: text file detection
+# -------------------
+TEXT_FILE_EXTENSIONS = {".py", ".js", ".ts", ".java", ".go", ".rs", ".c", ".cpp", ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".sh", ".rb", ".php"}
+
+def is_text_file(filename: str) -> bool:
+    return any(filename.lower().endswith(ext) for ext in TEXT_FILE_EXTENSIONS)
+
+# -------------------
+# Gemini / GenAI
 # -------------------
 client = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
 
-def call_genai_model(prompt: str) -> str:
+def call_model(prompt_text: str) -> str:
     try:
         response = client.models.generate_content(
             model=GCP_MODEL,
-            input=prompt  # <- новий синтаксис SDK
+            content=[{
+                "role": "user",
+                "content": prompt_text
+            }]
         )
-        if hasattr(response, "candidates") and len(response.candidates) > 0:
-            return response.candidates[0].content
-        return str(response)
+        if hasattr(response, "output") and response.output:
+            return response.output[0].content
+        return "(No content returned)"
     except Exception as e:
-        print("GenAI model call failed:", e)
-        return f"(GenAI call failed: {e})"
+        return f"GenAI model call failed: {e}"
 
 # -------------------
 # Comment building / posting
 # -------------------
 def build_comment(reviews: List[dict]) -> str:
-    lines = ["## Vertex AI — Automated Code Review (PoC)\n",
-             "I am an automated reviewer. Suggestions below:\n"]
+    lines = []
+    lines.append("## Vertex AI — Automated Code Review (Gemini 2.5 Flash)\n")
+    lines.append("I am an automated reviewer. Suggestions below:\n")
     for r in reviews:
         lines.append("---")
-        lines.append(f"**File:** `{r['path']}`\n")
-        lines.append(r["review"] + "\n")
-    lines.append("*This is an automated comment.*")
+        lines.append(f"**File:** `{r['path']}`")
+        lines.append("")
+        lines.append(r["review"])
+        lines.append("")
+    lines.append("\n*This is an automated comment.*")
     return "\n".join(lines)
 
 def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
@@ -124,18 +119,6 @@ def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
         print("Comment posted to PR")
     else:
         print("Failed to post comment:", r.status_code, r.text)
-
-# -------------------
-# Utility: detect likely text file
-# -------------------
-TEXT_FILE_EXTENSIONS = {".py", ".js", ".ts", ".java", ".go", ".rs", ".c", ".cpp", ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".sh", ".rb", ".php"}
-
-def is_text_file(filename: str) -> bool:
-    low = filename.lower()
-    for ext in TEXT_FILE_EXTENSIONS:
-        if low.endswith(ext):
-            return True
-    return True
 
 # -------------------
 # Main
@@ -161,25 +144,21 @@ def main():
         if not content:
             print("No content for", filename)
             continue
-        MAX_CHARS = 25000
-        if len(content) > MAX_CHARS:
-            content = content[:MAX_CHARS] + "\n\n...file truncated for brevity..."
+        if len(content) > 20000:
+            content = content[:20000] + "\n\n...file truncated..."
         prompt = (
-            "You are a senior software engineer and code reviewer.\n"
-            "Provide concise, actionable review comments as bullet points. "
-            "Mention potential bugs, security issues, and style improvements. "
-            "If you suggest code changes, provide short examples.\n\n"
-            f"Review file: {filename}\n\n```{content}```\n"
+            f"You are a senior software engineer and code reviewer.\n"
+            f"Provide concise, actionable review comments as bullet points. "
+            f"File: {filename}\n\n```{content}```"
         )
-        review_text = call_genai_model(prompt)
+        review_text = call_model(prompt)
         reviews.append({"path": filename, "review": review_text})
 
-    if not reviews:
+    if reviews:
+        comment = build_comment(reviews)
+        post_pr_comment(owner, repo, pr_number, comment)
+    else:
         print("No reviews generated.")
-        return
-
-    comment = build_comment(reviews)
-    post_pr_comment(owner, repo, pr_number, comment)
 
 if __name__ == "__main__":
     main()
