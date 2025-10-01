@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """
-review.py — Vertex AI Code Review bot (REST-based)
+review.py — Vertex AI Code Review bot (REST-based) — updated for Gemini
 
-- Отримує PR info з GITHUB_EVENT_PATH або з REPO+PR_NUMBER (локально).
-- Лістає файли PR через GitHub API.
-- Для кожного текстового файлу робить запит до Vertex AI Publisher predict endpoint:
-  https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:predict
-- Формує один коментар у PR з усіма оглядами.
-
-Env vars (в workflow встановлюються автоматично або через secrets):
-- GCP_PROJECT_ID
-- GCP_LOCATION (наприклад us-central1)
-- GCP_MODEL (наприклад text-bison@001 або gemini-1.5-flash)
-- GOOGLE_APPLICATION_CREDENTIALS -> шлях до service account JSON (в workflow пишемо /tmp/gcp-key.json)
-- GITHUB_TOKEN (в workflow підставляється як ${{ github.token }})
-- GITHUB_REPOSITORY (owner/repo) (в workflow підставляється автоматично)
-- PR_NUMBER (в workflow підставляється автоматично)
+- Автоматично вибирає endpoint:
+  * Gemini models (model name contains "gemini") -> :streamGenerateContent
+  * Others -> :predict
+- Робить запит з service account token
+- Формує один зведений коментар у PR
 """
 
 import os
 import sys
 import json
 import requests
-from typing import List, Optional
+from typing import List
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
@@ -31,7 +22,7 @@ from google.auth.transport.requests import Request
 # -------------------
 GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-GCP_MODEL = os.getenv("GCP_MODEL", "text-bison@001")  # publisher model id (Model Garden)
+GCP_MODEL = os.getenv("GCP_MODEL", "text-bison@001")  # e.g. gemini-1.5-flash-002
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -43,6 +34,12 @@ GH_HEADERS = {
     "Accept": "application/vnd.github+json",
     "Authorization": f"token {GITHUB_TOKEN}" if GITHUB_TOKEN else ""
 }
+
+# Debug prints (helpful for Actions logs)
+print("DEBUG: GCP_PROJECT_ID =", GCP_PROJECT)
+print("DEBUG: GCP_LOCATION =", GCP_LOCATION)
+print("DEBUG: GCP_MODEL =", GCP_MODEL)
+print("DEBUG: GOOGLE_APPLICATION_CREDENTIALS exists:", os.path.exists(os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")))
 
 # -------------------
 # Helpers: GitHub / PR
@@ -100,7 +97,7 @@ def fetch_raw_content(raw_url: str) -> str:
     return ""
 
 # -------------------
-# Helpers: GCP auth + Vertex predict
+# Helpers: GCP auth + endpoints
 # -------------------
 def get_access_token_from_service_account(sa_path: str) -> str:
     if not sa_path or not os.path.exists(sa_path):
@@ -113,71 +110,105 @@ def get_access_token_from_service_account(sa_path: str) -> str:
     creds.refresh(auth_req)
     return creds.token
 
+def is_gemini_model(model: str) -> bool:
+    if not model:
+        return False
+    return "gemini" in model.lower()
+
 def vertex_predict_endpoint(project: str, location: str, model: str) -> str:
-    # Accept model in forms like "text-bison@001" or "models/text-bison@001"
+    # For non-Gemini publisher predict
     model_id = model
     if model_id.startswith("models/"):
         model_id = model_id.split("/", 1)[1]
-    # publisher path for Model Garden
     return f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model_id}:predict"
 
+def vertex_stream_endpoint(project: str, location: str, model: str) -> str:
+    # For Gemini streamGenerateContent
+    # Accept forms like "gemini-1.5-flash-002" or "publishers/google/models/gemini-1.5-flash-002"
+    model_id = model.split("/")[-1]
+    return f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model_id}:streamGenerateContent"
+
 def extract_text_from_vertex_response(resp_json) -> str:
-    """
-    Try multiple common shapes returned by Vertex:
-    - {'predictions': [{'content': '...'}]}
-    - {'predictions': [{'candidates': [{'content':'...'}]}]}
-    - {'predictions': [{'output': [{'content':'...'}]}]}
-    Fall back to stringified JSON.
-    """
+    # robust extractor for several shapes
     if not isinstance(resp_json, dict):
         return str(resp_json)
+    # common top-level keys
+    # 1) predictions -> content / candidates / output
     preds = resp_json.get("predictions")
     if isinstance(preds, list) and len(preds) > 0:
         p0 = preds[0]
-        # candidate style
         if isinstance(p0, dict):
-            # common keys
             for k in ("content", "text", "output"):
                 if k in p0 and isinstance(p0[k], str):
                     return p0[k]
-            # nested candidates
-            if "candidates" in p0 and isinstance(p0["candidates"], list) and len(p0["candidates"])>0:
+            if "candidates" in p0 and isinstance(p0["candidates"], list) and len(p0["candidates"]) > 0:
                 c0 = p0["candidates"][0]
                 if isinstance(c0, dict):
                     if "content" in c0 and isinstance(c0["content"], str):
                         return c0["content"]
-                    # some responses place text under 'output' list
                     if "output" in c0 and isinstance(c0["output"], list) and len(c0["output"])>0:
                         out0 = c0["output"][0]
                         if isinstance(out0, dict) and "content" in out0:
                             return out0["content"]
-            # output list style
-            if "output" in p0 and isinstance(p0["output"], list) and len(p0["output"])>0:
-                out0 = p0["output"][0]
-                if isinstance(out0, dict):
-                    if "content" in out0 and isinstance(out0["content"], str):
-                        return out0["content"]
-    # fallback: try top-level content
-    if "content" in resp_json and isinstance(resp_json["content"], str):
-        return resp_json["content"]
+    # 2) candidates at top-level
+    if "candidates" in resp_json and isinstance(resp_json["candidates"], list) and len(resp_json["candidates"])>0:
+        first = resp_json["candidates"][0]
+        if isinstance(first, dict) and "content" in first:
+            return first["content"]
+    # 3) try to find nested 'content' fields anywhere (concatenate)
+    def find_content(d):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if k == "content" and isinstance(v, str):
+                    return v
+                res = find_content(v)
+                if res:
+                    return res
+        if isinstance(d, list):
+            for el in d:
+                res = find_content(el)
+                if res:
+                    return res
+        return None
+    found = find_content(resp_json)
+    if found:
+        return found
+    # fallback stringify
     return json.dumps(resp_json, ensure_ascii=False, indent=2)
 
 def call_vertex_predict(prompt: str, access_token: str) -> str:
     if not GCP_PROJECT:
         raise RuntimeError("GCP_PROJECT_ID not set")
-    endpoint = vertex_predict_endpoint(GCP_PROJECT, GCP_LOCATION, GCP_MODEL)
-    body = {
-        "instances": [{"content": prompt}],
-        "parameters": {
-            "maxOutputTokens": 512
-        }
-    }
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
+
+    if is_gemini_model(GCP_MODEL):
+        endpoint = vertex_stream_endpoint(GCP_PROJECT, GCP_LOCATION, GCP_MODEL)
+        body = {
+            "contents": {
+                "role": "user",
+                "parts": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    }
+                ]
+            },
+            # optional tuning
+            "temperature": 0.2,
+            "maxOutputTokens": 512
+        }
+    else:
+        endpoint = vertex_predict_endpoint(GCP_PROJECT, GCP_LOCATION, GCP_MODEL)
+        body = {
+            "instances": [{"content": prompt}],
+            "parameters": {"maxOutputTokens": 512}
+        }
+
     try:
-        r = requests.post(endpoint, headers=headers, json=body, timeout=60)
+        r = requests.post(endpoint, headers=headers, json=body, timeout=90)
     except Exception as e:
         print("Vertex request exception:", e)
         return f"(Vertex request failed: {e})"
@@ -223,7 +254,7 @@ def is_text_file(filename: str) -> bool:
     for ext in TEXT_FILE_EXTENSIONS:
         if low.endswith(ext):
             return True
-    # fallback: treat common scripts as text
+    # fallback: treat unknown as text (small risk)
     return True
 
 # -------------------
@@ -249,7 +280,6 @@ def main():
     for f in files:
         filename = f.get("filename")
         raw_url = f.get("raw_url")
-        # skip large binary-ish files by name
         if not is_text_file(filename):
             print("Skipping non-text file:", filename)
             continue
@@ -258,7 +288,6 @@ def main():
         if not content:
             print("No content for", filename)
             continue
-        # truncate large files
         MAX_CHARS = 25000
         if len(content) > MAX_CHARS:
             content = content[:MAX_CHARS] + "\n\n...file truncated for brevity..."
