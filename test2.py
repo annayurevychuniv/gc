@@ -1,0 +1,1 @@
+print("Vertex AI test")
