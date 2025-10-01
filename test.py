@@ -1,7 +1,6 @@
 # Test file for Vertex AI Code Review Bot
 print("Hello, world!")
 
-
 # ❌ 1. Використання незахищеного вводу
 user_input = input("Enter a number: ")
 print("Result:", int(user_input) * 2)
