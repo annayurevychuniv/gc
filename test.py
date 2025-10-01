@@ -12,6 +12,7 @@ password = "123456"
 if password == "123456":
     print("Weak password in code!")
 
+
 # ❌ 3. Функція без докстрінгу і без обробки винятків
 def divide(a, b):
     return a / b
