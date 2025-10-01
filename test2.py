@@ -1,1 +1,1 @@
-print("Vertex AI test")
+print("Vertex test")
