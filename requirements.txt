@@ -1,2 +1,2 @@
 requests>=2.31
-google-genai>=0.12.1
+google-genai
