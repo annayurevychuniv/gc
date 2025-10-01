@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-review.py — Vertex AI Code Review bot (REST-based)
+review.py — Vertex AI / Google Generative AI Code Review bot
 
-Підтримує Gemini 1.5 Flash (gemini-1.5-flash-002) та інші моделі.
+Використовує Google Generative AI SDK для Gemini 2.5 Flash замість старого Vertex Predict REST.
+
+Env vars:
+- GCP_PROJECT_ID
+- GCP_LOCATION (наприклад us-central1)
+- GCP_MODEL (наприклад gemini-2.5-flash)
+- GOOGLE_APPLICATION_CREDENTIALS -> шлях до service account JSON
+- GITHUB_TOKEN
+- GITHUB_REPOSITORY (owner/repo)
+- PR_NUMBER
 """
 
 import os
@@ -10,13 +19,14 @@ import sys
 import json
 import requests
 from typing import List
+from google import genai
 
 # -------------------
 # Config from env
 # -------------------
 GCP_PROJECT = os.getenv("GCP_PROJECT_ID")
 GCP_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-GCP_MODEL = os.getenv("GCP_MODEL", "gemini-1.5-flash-002")  # Gemini або text-bison@001
+GCP_MODEL = os.getenv("GCP_MODEL", "gemini-2.5-flash")
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -29,7 +39,7 @@ GH_HEADERS = {
 }
 
 # -------------------
-# Helpers: GitHub / PR
+# GitHub / PR helpers
 # -------------------
 def get_event_json():
     ev_path = os.getenv("GITHUB_EVENT_PATH")
@@ -48,7 +58,7 @@ def get_pr_info():
     if GITHUB_REPOSITORY and PR_NUMBER_ENV:
         owner, repo = GITHUB_REPOSITORY.split("/")
         return owner, repo, int(PR_NUMBER_ENV)
-    print("ERROR: Could not determine PR info.")
+    print("ERROR: Could not determine PR info")
     sys.exit(1)
 
 def list_pr_files(owner: str, repo: str, pr_number: int) -> List[dict]:
@@ -70,73 +80,50 @@ def list_pr_files(owner: str, repo: str, pr_number: int) -> List[dict]:
     return files
 
 def fetch_raw_content(raw_url: str) -> str:
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+    headers = {}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
     try:
         r = requests.get(raw_url, headers=headers, timeout=30)
         if r.status_code == 200:
             return r.text
+        print(f"Failed to fetch raw content ({raw_url}): {r.status_code}")
     except Exception as e:
         print("Exception fetching raw content:", e)
     return ""
 
 # -------------------
-# Helpers: GCP auth + Vertex REST
+# GCP GenAI SDK
 # -------------------
-from google.oauth2 import service_account
-from google.auth.transport.requests import Request
+client = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
 
-def get_access_token(sa_path: str) -> str:
-    creds = service_account.Credentials.from_service_account_file(
-        sa_path,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    creds.refresh(Request())
-    return creds.token
-
-def is_gemini_model(model_id: str) -> bool:
-    return "gemini" in model_id.lower()
-
-def vertex_endpoint(project: str, location: str, model: str) -> str:
-    if is_gemini_model(model):
-        return f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:predict"
-    else:
-        return f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:predict"
-
-def call_vertex_predict(prompt: str, access_token: str) -> str:
-    endpoint = vertex_endpoint(GCP_PROJECT, GCP_LOCATION, GCP_MODEL)
-    body = {
-        "instances": [{"content": prompt}],
-        "parameters": {"temperature": 0.2, "maxOutputTokens": 512}
-    }
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-
+def call_genai_model(prompt: str) -> str:
     try:
-        r = requests.post(endpoint, headers=headers, json=body, timeout=90)
+        response = client.models.generate_content(
+            model=GCP_MODEL,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        if hasattr(response, "candidates") and len(response.candidates) > 0:
+            return response.candidates[0].content
+        return str(response)
     except Exception as e:
-        return f"(Vertex request failed: {e})"
-    
-    if r.status_code not in (200, 201):
-        print("Vertex error:", r.status_code, r.text)
-        return f"(Vertex error {r.status_code}: {r.text})"
-    
-    resp_json = r.json()
-    # Extract first content from response
-    preds = resp_json.get("predictions", [])
-    if preds and isinstance(preds[0], dict) and "content" in preds[0]:
-        return preds[0]["content"]
-    return json.dumps(resp_json, ensure_ascii=False, indent=2)
+        print("GenAI model call failed:", e)
+        return f"(GenAI call failed: {e})"
 
 # -------------------
 # Comment building / posting
 # -------------------
 def build_comment(reviews: List[dict]) -> str:
-    lines = ["## Vertex AI — Automated Code Review (PoC)\n",
-             "Automated review suggestions:\n"]
+    lines = []
+    lines.append("## Gemini AI — Automated Code Review\n")
+    lines.append("I am an automated reviewer. Suggestions below:\n")
     for r in reviews:
         lines.append("---")
-        lines.append(f"**File:** `{r['path']}`\n")
-        lines.append(r["review"] + "\n")
-    lines.append("*This is an automated comment.*")
+        lines.append(f"**File:** `{r['path']}`")
+        lines.append("")
+        lines.append(r["review"])
+        lines.append("")
+    lines.append("\n*This is an automated comment.*")
     return "\n".join(lines)
 
 def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
@@ -148,12 +135,16 @@ def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
         print("Failed to post comment:", r.status_code, r.text)
 
 # -------------------
-# File utility
+# Utility
 # -------------------
 TEXT_FILE_EXTENSIONS = {".py", ".js", ".ts", ".java", ".go", ".rs", ".c", ".cpp", ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".sh", ".rb", ".php"}
 
 def is_text_file(filename: str) -> bool:
-    return any(filename.lower().endswith(ext) for ext in TEXT_FILE_EXTENSIONS)
+    low = filename.lower()
+    for ext in TEXT_FILE_EXTENSIONS:
+        if low.endswith(ext):
+            return True
+    return True
 
 # -------------------
 # Main
@@ -167,37 +158,37 @@ def main():
         print("No files to review")
         return
 
-    try:
-        token = get_access_token(SERVICE_ACCOUNT_JSON)
-    except Exception as e:
-        print("Failed to get access token:", e)
-        sys.exit(1)
-
     reviews = []
     for f in files:
         filename = f.get("filename")
         raw_url = f.get("raw_url")
         if not is_text_file(filename):
+            print("Skipping non-text file:", filename)
             continue
+        print("Processing", filename)
         content = fetch_raw_content(raw_url)
         if not content:
+            print("No content for", filename)
             continue
         MAX_CHARS = 25000
         if len(content) > MAX_CHARS:
             content = content[:MAX_CHARS] + "\n\n...file truncated..."
         prompt = (
             "You are a senior software engineer and code reviewer.\n"
-            "Provide concise, actionable review comments as bullet points.\n"
-            f"Review file: {filename}\n\n```{content}```"
+            "Provide concise, actionable review comments as bullet points. "
+            "Mention potential bugs, security issues, and style improvements. "
+            "If you suggest code changes, provide short examples.\n\n"
+            f"Review file: {filename}\n\n```{content}```\n"
         )
-        review_text = call_vertex_predict(prompt, token)
+        review_text = call_genai_model(prompt)
         reviews.append({"path": filename, "review": review_text})
 
-    if reviews:
-        comment = build_comment(reviews)
-        post_pr_comment(owner, repo, pr_number, comment)
-    else:
+    if not reviews:
         print("No reviews generated.")
+        return
+
+    comment = build_comment(reviews)
+    post_pr_comment(owner, repo, pr_number, comment)
 
 if __name__ == "__main__":
     main()
