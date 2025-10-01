@@ -1,4 +1,4 @@
-google-cloud-aiplatform
-PyGithub
+google-auth
 requests
+PyGithub
 python-dotenv
