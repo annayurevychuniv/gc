@@ -5,6 +5,7 @@ print("Hello, world!")
 user_input = input("Enter a number: ")
 print("Result:", int(user_input) * 2)
 
+
 # ❌ 2. Харкоджений пароль (погана практика)
 password = "123456"
 if password == "123456":
