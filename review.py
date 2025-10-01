@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 """
 review.py — Vertex AI Code Review bot (Google GenAI SDK, works with Gemini)
 
